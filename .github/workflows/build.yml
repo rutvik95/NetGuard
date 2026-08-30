@@ -1,0 +1,55 @@
+name: Build debug APK
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install NDK
+        run: sdkmanager --install "ndk;25.2.9519653"
+
+      # app/build.gradle reads keystore.properties at configuration time and
+      # fails without it, even for a debug build. This throwaway key only
+      # satisfies that; the debug APK is signed with the standard debug key.
+      - name: Create throwaway signing config
+        run: |
+          keytool -genkeypair -v \
+            -keystore ci-throwaway.jks \
+            -storepass netguard -keypass netguard \
+            -alias ci -keyalg RSA -keysize 2048 -validity 3650 \
+            -dname "CN=NetGuard CI, O=none, C=NL"
+          cat > keystore.properties <<'EOF'
+          storeFile=../ci-throwaway.jks
+          storePassword=netguard
+          keyAlias=ci
+          keyPassword=netguard
+          EOF
+
+      - name: Build debug APK
+        run: ./gradlew assembleDebug --no-daemon --stacktrace
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: NetGuard-debug-apk
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
