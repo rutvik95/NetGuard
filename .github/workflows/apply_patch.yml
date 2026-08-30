@@ -1,0 +1,63 @@
+name: Apply patch
+
+# Run this manually from the Actions tab after uploading the .patch file
+# to the root of the repository.
+#
+# Note: GITHUB_TOKEN has no "workflows" permission, so the patch must not
+# touch anything under .github/workflows/ or the push will be rejected.
+
+on:
+  workflow_dispatch:
+    inputs:
+      patch_file:
+        description: Patch file in the repo root
+        required: true
+        default: netguard-screen-off-pulse.patch
+      delete_patch:
+        description: Delete the patch file after applying
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Check the patch applies cleanly
+        run: |
+          PATCH="${{ inputs.patch_file }}"
+          if [ ! -f "$PATCH" ]; then
+            echo "::error::$PATCH not found in the repository root."
+            exit 1
+          fi
+          if git apply --reverse --check "$PATCH" 2>/dev/null; then
+            echo "::error::This patch is already applied. Nothing to do."
+            exit 1
+          fi
+          git apply --check --verbose "$PATCH"
+
+      - name: Apply and commit
+        run: |
+          PATCH="${{ inputs.patch_file }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git apply --index --whitespace=nowarn "$PATCH"
+          if [ "${{ inputs.delete_patch }}" = "true" ]; then
+            git rm -q "$PATCH"
+          fi
+          git commit -m "Periodic network access for screen on rules while the screen is off"
+          git push
+
+      - name: Summary
+        run: |
+          echo "### Patch applied" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Now run the **Build debug APK** workflow manually." >> $GITHUB_STEP_SUMMARY
+          echo "A push made with GITHUB_TOKEN does not trigger other workflows." >> $GITHUB_STEP_SUMMARY
+          git show --stat --oneline HEAD >> $GITHUB_STEP_SUMMARY
