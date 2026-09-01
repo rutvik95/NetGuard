@@ -142,6 +142,12 @@ public class ActivitySettings extends AppCompatActivity implements SharedPrefere
         Preference pref_screen_delay = screen.findPreference("screen_delay");
         pref_screen_delay.setTitle(getString(R.string.setting_delay, prefs.getString("screen_delay", "0")));
 
+        // Handle periodic screen off pulse
+        Preference pref_pulse_interval = screen.findPreference("screen_pulse_interval");
+        if (pref_pulse_interval != null) pref_pulse_interval.setTitle(getString(R.string.setting_pulse_interval, prefs.getString("screen_pulse_interval", "15")));
+        Preference pref_pulse_duration = screen.findPreference("screen_pulse_duration");
+        if (pref_pulse_duration != null) pref_pulse_duration.setTitle(getString(R.string.setting_pulse_duration, prefs.getString("screen_pulse_duration", "15")));
+
         // Handle theme
         Preference pref_screen_theme = screen.findPreference("theme");
         String theme = prefs.getString("theme", "teal");
@@ -548,6 +554,15 @@ public class ActivitySettings extends AppCompatActivity implements SharedPrefere
 
         else if ("screen_delay".equals(name))
             getPreferenceScreen().findPreference(name).setTitle(getString(R.string.setting_delay, prefs.getString(name, "0")));
+
+        else if ("screen_pulse".equals(name))
+            ServiceSinkhole.reload("changed " + name, this, false);
+
+        else if ("screen_pulse_interval".equals(name))
+            getPreferenceScreen().findPreference(name).setTitle(getString(R.string.setting_pulse_interval, prefs.getString(name, "15")));
+
+        else if ("screen_pulse_duration".equals(name))
+            getPreferenceScreen().findPreference(name).setTitle(getString(R.string.setting_pulse_duration, prefs.getString(name, "15")));
 
         else if ("theme".equals(name) || "dark_theme".equals(name))
             recreate();

@@ -83,6 +83,9 @@
     <string name="setting_screen_on">Apply \'when screen on\' rules</string>
     <string name="setting_auto">Auto enable after %1$s minutes</string>
     <string name="setting_delay">Delay screen off %1$s minutes</string>
+    <string name="setting_pulse">Periodic internet pulse when screen off</string>
+    <string name="setting_pulse_interval">Pulse interval: %1$s minutes</string>
+    <string name="setting_pulse_duration">Pulse duration: %1$s seconds</string>
     <string name="setting_update">Check for updates</string>
 
     <string name="setting_network_options">Network options</string>
@@ -154,6 +157,9 @@
     <string name="summary_install">Show status bar notification to directly configure newly installed apps (pro feature)</string>
     <string name="summary_auto">After disabling using the widget, automatically enable NetGuard again after the selected number of minutes (enter zero to disable this option)</string>
     <string name="summary_delay">After turning the screen off, keep screen on rules active for the selected number of minutes (enter zero to disable this option)</string>
+    <string name="summary_pulse">While the screen is off, temporarily grant internet access at regular intervals so background apps can sync notifications.</string>
+    <string name="summary_pulse_interval">How often to trigger the background sync. Minimum is 1 minute.</string>
+    <string name="summary_pulse_duration">How long to hold the device awake during a sync. Minimum is 5 seconds.</string>
     <string name="summary_update">Check for new releases on GitHub twice daily</string>
 
     <string name="summary_tethering">Depending on the Android version, tethering may work or may not work. Tethered traffic cannot be filtered.</string>

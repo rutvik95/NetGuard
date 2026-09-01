@@ -136,7 +136,10 @@ public class ServiceSinkhole extends VpnService implements SharedPreferences.OnS
     private boolean last_connected = false;
     private boolean last_metered = true;
     private boolean last_interactive = false;
-
+    // Screen-off pulse states
+    private volatile boolean isPulseActive = false;
+    private PowerManager.WakeLock pulseWakeLock = null;
+    private Handler pulseHandler = null;
     private int last_allowed = -1;
     private int last_blocked = -1;
     private int last_hosts = -1;
@@ -202,6 +205,7 @@ public class ServiceSinkhole extends VpnService implements SharedPreferences.OnS
 
     private static final String ACTION_HOUSE_HOLDING = "eu.faircode.netguard.HOUSE_HOLDING";
     private static final String ACTION_SCREEN_OFF_DELAYED = "eu.faircode.netguard.SCREEN_OFF_DELAYED";
+    private static final String ACTION_PULSE_TRIGGER = "eu.faircode.netguard.PULSE_TRIGGER";
     private static final String ACTION_WATCHDOG = "eu.faircode.netguard.WATCHDOG";
 
     private native long jni_init(int sdk);
@@ -354,6 +358,7 @@ public class ServiceSinkhole extends VpnService implements SharedPreferences.OnS
                     ifInteractive.addAction(Intent.ACTION_SCREEN_ON);
                     ifInteractive.addAction(Intent.ACTION_SCREEN_OFF);
                     ifInteractive.addAction(ACTION_SCREEN_OFF_DELAYED);
+                    ifInteractive.addAction(ACTION_PULSE_TRIGGER);
                     ContextCompat.registerReceiver(ServiceSinkhole.this, interactiveStateReceiver, ifInteractive, ContextCompat.RECEIVER_NOT_EXPORTED);
                     registeredInteractiveState = true;
                 }
@@ -1940,15 +1945,16 @@ public class ServiceSinkhole extends VpnService implements SharedPreferences.OnS
                 " generation=" + generation +
                 " roaming=" + roaming + "/" + org_roaming +
                 " interactive=" + last_interactive +
+                " pulseActive=" + isPulseActive +
                 " tethering=" + tethering +
                 " filter=" + filter +
                 " lockdown=" + lockdown);
 
-        if (last_connected)
+if (last_connected)
             for (Rule rule : listRule) {
                 boolean blocked = (metered ? rule.other_blocked : rule.wifi_blocked);
                 boolean screen = (metered ? rule.screen_other : rule.screen_wifi);
-                if ((!blocked || (screen && last_interactive)) &&
+                if ((!blocked || (screen && (last_interactive || isPulseActive))) &&
                         (!metered || !(rule.roaming && roaming)) &&
                         (!lockdown || rule.lockdown))
                     listAllowed.add(rule);
@@ -2131,8 +2137,83 @@ public class ServiceSinkhole extends VpnService implements SharedPreferences.OnS
     private void accountUsage(Usage usage) {
         logHandler.account(usage);
     }
+private void scheduleNextPulse() {
+        SharedPreferences prefs = PreferenceManager.getDefaultSharedPreferences(this);
+        if (!prefs.getBoolean("screen_pulse", false) || last_interactive) {
+            abortPulse();
+            return;
+        }
 
-    private BroadcastReceiver interactiveStateReceiver = new BroadcastReceiver() {
+        int intervalMins = 15;
+        try { intervalMins = Integer.parseInt(prefs.getString("screen_pulse_interval", "15")); }
+        catch (NumberFormatException ignored) {}
+        intervalMins = Math.max(1, intervalMins); // Minimum 1 minute
+
+        long triggerAt = SystemClock.elapsedRealtime() + (intervalMins * 60 * 1000L);
+
+        AlarmManager am = (AlarmManager) getSystemService(Context.ALARM_SERVICE);
+        Intent i = new Intent(ACTION_PULSE_TRIGGER).setPackage(getPackageName());
+        PendingIntent pi = PendingIntentCompat.getBroadcast(this, 2, i, PendingIntent.FLAG_UPDATE_CURRENT);
+
+        am.cancel(pi);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M)
+            am.setExactAndAllowWhileIdle(AlarmManager.ELAPSED_REALTIME_WAKEUP, triggerAt, pi);
+        else
+            am.set(AlarmManager.ELAPSED_REALTIME_WAKEUP, triggerAt, pi);
+    }
+
+    private void executePulseStart() {
+        if (last_interactive) return;
+        SharedPreferences prefs = PreferenceManager.getDefaultSharedPreferences(this);
+        if (!prefs.getBoolean("screen_pulse", false)) return;
+
+        int durationSecs = 15;
+        try { durationSecs = Integer.parseInt(prefs.getString("screen_pulse_duration", "15")); }
+        catch (NumberFormatException ignored) {}
+        durationSecs = Math.min(300, Math.max(5, durationSecs)); // Clamp 5-300s
+
+        if (pulseWakeLock != null) pulseWakeLock.acquire((durationSecs + 5) * 1000L);
+
+        isPulseActive = true;
+        reload("pulse start", this, true);
+
+        if (pulseHandler != null) {
+            pulseHandler.removeCallbacksAndMessages(null);
+            pulseHandler.postDelayed(new Runnable() {
+                @Override
+                public void run() {
+                    executor.submit(new Runnable() {
+                        @Override
+                        public void run() { executePulseStop(); }
+                    });
+                }
+            }, durationSecs * 1000L);
+        }
+    }
+
+    private synchronized void executePulseStop() {
+        if (!isPulseActive) return;
+        isPulseActive = false;
+
+        if (!last_interactive) reload("pulse end", this, true);
+
+        if (pulseWakeLock != null && pulseWakeLock.isHeld()) {
+            try { pulseWakeLock.release(); } catch (Exception ignored) {}
+        }
+        if (!last_interactive) scheduleNextPulse();
+    }
+
+    private void abortPulse() {
+        AlarmManager am = (AlarmManager) getSystemService(Context.ALARM_SERVICE);
+        Intent i = new Intent(ACTION_PULSE_TRIGGER).setPackage(getPackageName());
+        am.cancel(PendingIntentCompat.getBroadcast(this, 2, i, PendingIntent.FLAG_UPDATE_CURRENT));
+        if (pulseHandler != null) pulseHandler.removeCallbacksAndMessages(null);
+        isPulseActive = false;
+        if (pulseWakeLock != null && pulseWakeLock.isHeld()) {
+            try { pulseWakeLock.release(); } catch (Exception ignored) {}
+        }
+    }
+private BroadcastReceiver interactiveStateReceiver = new BroadcastReceiver() {
         @Override
         public void onReceive(final Context context, final Intent intent) {
             Log.i(TAG, "Received " + intent);
@@ -2145,6 +2226,12 @@ public class ServiceSinkhole extends VpnService implements SharedPreferences.OnS
                     Intent i = new Intent(ACTION_SCREEN_OFF_DELAYED);
                     i.setPackage(context.getPackageName());
                     PendingIntent pi = PendingIntentCompat.getBroadcast(context, 0, i, PendingIntent.FLAG_UPDATE_CURRENT);
+
+                    if (ACTION_PULSE_TRIGGER.equals(intent.getAction())) {
+                        executePulseStart();
+                        return;
+                    }
+
                     am.cancel(pi);
 
                     try {
@@ -2155,21 +2242,22 @@ public class ServiceSinkhole extends VpnService implements SharedPreferences.OnS
                         } catch (NumberFormatException ignored) {
                             delay = 0;
                         }
-                        boolean interactive = Intent.ACTION_SCREEN_ON.equals(intent.getAction());
+                        String action = intent.getAction();
+                        boolean interactive = Intent.ACTION_SCREEN_ON.equals(action);
 
-                        if (interactive || delay == 0) {
-                            last_interactive = interactive;
+                        if (interactive) {
+                            last_interactive = true;
+                            abortPulse();
                             reload("interactive state changed", ServiceSinkhole.this, true);
+                        } else if (delay == 0 || ACTION_SCREEN_OFF_DELAYED.equals(action)) {
+                            last_interactive = false;
+                            reload("interactive state changed", ServiceSinkhole.this, true);
+                            scheduleNextPulse();
                         } else {
-                            if (ACTION_SCREEN_OFF_DELAYED.equals(intent.getAction())) {
-                                last_interactive = interactive;
-                                reload("interactive state changed", ServiceSinkhole.this, true);
-                            } else {
-                                if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M)
-                                    am.set(AlarmManager.RTC_WAKEUP, new Date().getTime() + delay * 60 * 1000L, pi);
-                                else
-                                    am.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, new Date().getTime() + delay * 60 * 1000L, pi);
-                            }
+                            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M)
+                                am.set(AlarmManager.RTC_WAKEUP, new Date().getTime() + delay * 60 * 1000L, pi);
+                            else
+                                am.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, new Date().getTime() + delay * 60 * 1000L, pi);
                         }
 
                         // Start/stop stats
@@ -2571,7 +2659,10 @@ public class ServiceSinkhole extends VpnService implements SharedPreferences.OnS
 
         Util.setTheme(this);
         super.onCreate();
-
+        PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
+        pulseWakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, getString(R.string.app_name) + ":Pulse");
+        pulseWakeLock.setReferenceCounted(false);
+        pulseHandler = new Handler(Looper.getMainLooper());
         HandlerThread commandThread = new HandlerThread(getString(R.string.app_name) + " command", Process.THREAD_PRIORITY_FOREGROUND);
         HandlerThread logThread = new HandlerThread(getString(R.string.app_name) + " log", Process.THREAD_PRIORITY_BACKGROUND);
         HandlerThread statsThread = new HandlerThread(getString(R.string.app_name) + " stats", Process.THREAD_PRIORITY_BACKGROUND);
@@ -2840,6 +2931,14 @@ public class ServiceSinkhole extends VpnService implements SharedPreferences.OnS
                 Log.d(TAG, "Stop foreground state=" + state.toString());
                 stopForeground(true);
             }
+            if ("screen_pulse".equals(name) || "screen_pulse_interval".equals(name) || "screen_pulse_duration".equals(name)) {
+            if (prefs.getBoolean("screen_pulse", false)) {
+                if (!last_interactive) scheduleNextPulse();
+            } else {
+                abortPulse();
+                if (!last_interactive) reload("pulse disabled", this, true);
+            }
+        }
             if (state == State.enforcing)
                 startForeground(NOTIFY_ENFORCING, getEnforcingNotification(-1, -1, -1));
             else if (state != State.none)
@@ -2961,6 +3060,7 @@ public class ServiceSinkhole extends VpnService implements SharedPreferences.OnS
                 unregisterReceiver(interactiveStateReceiver);
                 registeredInteractiveState = false;
             }
+            abortPulse();
             if (callStateListener != null) {
                 TelephonyManager tm = (TelephonyManager) getSystemService(Context.TELEPHONY_SERVICE);
                 tm.listen(callStateListener, PhoneStateListener.LISTEN_NONE);
