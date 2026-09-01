@@ -136,9 +136,6 @@ public class ServiceSinkhole extends VpnService implements SharedPreferences.OnS
     private boolean last_connected = false;
     private boolean last_metered = true;
     private boolean last_interactive = false;
-    private volatile boolean pulse_active = false;
-    private PowerManager.WakeLock wlPulse = null;
-    private Handler pulseHandler = null;
 
     private int last_allowed = -1;
     private int last_blocked = -1;
@@ -205,7 +202,6 @@ public class ServiceSinkhole extends VpnService implements SharedPreferences.OnS
 
     private static final String ACTION_HOUSE_HOLDING = "eu.faircode.netguard.HOUSE_HOLDING";
     private static final String ACTION_SCREEN_OFF_DELAYED = "eu.faircode.netguard.SCREEN_OFF_DELAYED";
-    private static final String ACTION_SCREEN_PULSE = "eu.faircode.netguard.SCREEN_PULSE";
     private static final String ACTION_WATCHDOG = "eu.faircode.netguard.WATCHDOG";
 
     private native long jni_init(int sdk);
@@ -358,7 +354,6 @@ public class ServiceSinkhole extends VpnService implements SharedPreferences.OnS
                     ifInteractive.addAction(Intent.ACTION_SCREEN_ON);
                     ifInteractive.addAction(Intent.ACTION_SCREEN_OFF);
                     ifInteractive.addAction(ACTION_SCREEN_OFF_DELAYED);
-                    ifInteractive.addAction(ACTION_SCREEN_PULSE);
                     ContextCompat.registerReceiver(ServiceSinkhole.this, interactiveStateReceiver, ifInteractive, ContextCompat.RECEIVER_NOT_EXPORTED);
                     registeredInteractiveState = true;
                 }
@@ -1945,7 +1940,6 @@ public class ServiceSinkhole extends VpnService implements SharedPreferences.OnS
                 " generation=" + generation +
                 " roaming=" + roaming + "/" + org_roaming +
                 " interactive=" + last_interactive +
-                " pulse=" + pulse_active +
                 " tethering=" + tethering +
                 " filter=" + filter +
                 " lockdown=" + lockdown);
@@ -1954,7 +1948,7 @@ public class ServiceSinkhole extends VpnService implements SharedPreferences.OnS
             for (Rule rule : listRule) {
                 boolean blocked = (metered ? rule.other_blocked : rule.wifi_blocked);
                 boolean screen = (metered ? rule.screen_other : rule.screen_wifi);
-                if ((!blocked || (screen && (last_interactive || pulse_active))) &&
+                if ((!blocked || (screen && last_interactive)) &&
                         (!metered || !(rule.roaming && roaming)) &&
                         (!lockdown || rule.lockdown))
                     listAllowed.add(rule);
@@ -2138,105 +2132,6 @@ public class ServiceSinkhole extends VpnService implements SharedPreferences.OnS
         logHandler.account(usage);
     }
 
-    private PendingIntent getPulseIntent() {
-        Intent i = new Intent(ACTION_SCREEN_PULSE);
-        i.setPackage(getPackageName());
-        // Request code 1 to not collide with the screen off delay alarm
-        return PendingIntentCompat.getBroadcast(this, 1, i, PendingIntent.FLAG_UPDATE_CURRENT);
-    }
-
-    // Schedule the next window in which screen on rules are temporarily applied
-    private void schedulePulse() {
-        SharedPreferences prefs = PreferenceManager.getDefaultSharedPreferences(this);
-        if (!prefs.getBoolean("screen_pulse", false))
-            return;
-
-        int interval;
-        try {
-            interval = Integer.parseInt(prefs.getString("screen_pulse_interval", "15"));
-        } catch (NumberFormatException ignored) {
-            interval = 15;
-        }
-        if (interval <= 0)
-            return;
-
-        long trigger = new Date().getTime() + interval * 60 * 1000L;
-        Log.i(TAG, "Scheduling screen pulse in " + interval + " minutes");
-
-        AlarmManager am = (AlarmManager) getSystemService(Context.ALARM_SERVICE);
-        PendingIntent pi = getPulseIntent();
-        am.cancel(pi);
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M)
-            am.set(AlarmManager.RTC_WAKEUP, trigger, pi);
-        else
-            am.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, trigger, pi);
-    }
-
-    // Open a window, then close it again after the configured number of seconds
-    private void startPulse() {
-        if (last_interactive) {
-            Log.i(TAG, "Skipping screen pulse, screen is on");
-            return;
-        }
-
-        SharedPreferences prefs = PreferenceManager.getDefaultSharedPreferences(this);
-        int duration;
-        try {
-            duration = Integer.parseInt(prefs.getString("screen_pulse_duration", "15"));
-        } catch (NumberFormatException ignored) {
-            duration = 15;
-        }
-        if (duration <= 0)
-            duration = 15;
-
-        Log.i(TAG, "Screen pulse start duration=" + duration + " seconds");
-
-        // Keep the CPU up so the window really lasts the configured time
-        if (wlPulse != null)
-            wlPulse.acquire((duration + 5) * 1000L);
-
-        pulse_active = true;
-        reload("screen pulse start", ServiceSinkhole.this, true);
-
-        pulseHandler.removeCallbacksAndMessages(null);
-        pulseHandler.postDelayed(new Runnable() {
-            @Override
-            public void run() {
-                executor.submit(new Runnable() {
-                    @Override
-                    public void run() {
-                        endPulse(true);
-                    }
-                });
-            }
-        }, duration * 1000L);
-    }
-
-    private void endPulse(boolean reschedule) {
-        if (pulse_active) {
-            Log.i(TAG, "Screen pulse end");
-            pulse_active = false;
-            if (reschedule)
-                reload("screen pulse end", ServiceSinkhole.this, true);
-        }
-
-        if (wlPulse != null && wlPulse.isHeld())
-            wlPulse.release();
-
-        if (reschedule && !last_interactive)
-            schedulePulse();
-    }
-
-    // Called when the screen turns on and when the service stops
-    private void cancelPulse() {
-        AlarmManager am = (AlarmManager) getSystemService(Context.ALARM_SERVICE);
-        am.cancel(getPulseIntent());
-        if (pulseHandler != null)
-            pulseHandler.removeCallbacksAndMessages(null);
-        // The caller reloads the rules
-        endPulse(false);
-    }
-
     private BroadcastReceiver interactiveStateReceiver = new BroadcastReceiver() {
         @Override
         public void onReceive(final Context context, final Intent intent) {
@@ -2250,13 +2145,6 @@ public class ServiceSinkhole extends VpnService implements SharedPreferences.OnS
                     Intent i = new Intent(ACTION_SCREEN_OFF_DELAYED);
                     i.setPackage(context.getPackageName());
                     PendingIntent pi = PendingIntentCompat.getBroadcast(context, 0, i, PendingIntent.FLAG_UPDATE_CURRENT);
-
-                    // A pulse alarm does not change the interactive state
-                    if (ACTION_SCREEN_PULSE.equals(intent.getAction())) {
-                        startPulse();
-                        return;
-                    }
-
                     am.cancel(pi);
 
                     try {
@@ -2267,22 +2155,21 @@ public class ServiceSinkhole extends VpnService implements SharedPreferences.OnS
                         } catch (NumberFormatException ignored) {
                             delay = 0;
                         }
-                        String action = intent.getAction();
-                        boolean interactive = Intent.ACTION_SCREEN_ON.equals(action);
+                        boolean interactive = Intent.ACTION_SCREEN_ON.equals(intent.getAction());
 
-                        if (interactive) {
-                            last_interactive = true;
-                            cancelPulse();
+                        if (interactive || delay == 0) {
+                            last_interactive = interactive;
                             reload("interactive state changed", ServiceSinkhole.this, true);
-                        } else if (delay == 0 || ACTION_SCREEN_OFF_DELAYED.equals(action)) {
-                            last_interactive = false;
-                            reload("interactive state changed", ServiceSinkhole.this, true);
-                            schedulePulse();
                         } else {
-                            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M)
-                                am.set(AlarmManager.RTC_WAKEUP, new Date().getTime() + delay * 60 * 1000L, pi);
-                            else
-                                am.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, new Date().getTime() + delay * 60 * 1000L, pi);
+                            if (ACTION_SCREEN_OFF_DELAYED.equals(intent.getAction())) {
+                                last_interactive = interactive;
+                                reload("interactive state changed", ServiceSinkhole.this, true);
+                            } else {
+                                if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M)
+                                    am.set(AlarmManager.RTC_WAKEUP, new Date().getTime() + delay * 60 * 1000L, pi);
+                                else
+                                    am.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, new Date().getTime() + delay * 60 * 1000L, pi);
+                            }
                         }
 
                         // Start/stop stats
@@ -2682,12 +2569,6 @@ public class ServiceSinkhole extends VpnService implements SharedPreferences.OnS
 
         prefs.registerOnSharedPreferenceChangeListener(this);
 
-        // Screen off pulse
-        PowerManager pmPulse = (PowerManager) getSystemService(Context.POWER_SERVICE);
-        wlPulse = pmPulse.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, getString(R.string.app_name) + " pulse");
-        wlPulse.setReferenceCounted(false);
-        pulseHandler = new Handler(Looper.getMainLooper());
-
         Util.setTheme(this);
         super.onCreate();
 
@@ -3080,7 +2961,6 @@ public class ServiceSinkhole extends VpnService implements SharedPreferences.OnS
                 unregisterReceiver(interactiveStateReceiver);
                 registeredInteractiveState = false;
             }
-            cancelPulse();
             if (callStateListener != null) {
                 TelephonyManager tm = (TelephonyManager) getSystemService(Context.TELEPHONY_SERVICE);
                 tm.listen(callStateListener, PhoneStateListener.LISTEN_NONE);
