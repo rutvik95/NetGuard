@@ -2177,6 +2177,7 @@ private void scheduleNextPulse() {
         isPulseActive = true;
         reload("pulse start", this, true);
         forceFcmHeartbeat();
+        forceFcmHeartbeat();
         if (pulseHandler != null) {
             pulseHandler.removeCallbacksAndMessages(null);
             pulseHandler.postDelayed(new Runnable() {
@@ -2266,6 +2267,7 @@ private BroadcastReceiver interactiveStateReceiver = new BroadcastReceiver() {
                             last_interactive = true;
                             abortPulse();
                             reload("interactive state changed", ServiceSinkhole.this, true);
+                            forceFcmHeartbeat();
                             forceFcmHeartbeat();
                         } else if (delay == 0 || ACTION_SCREEN_OFF_DELAYED.equals(action)) {
                             last_interactive = false;
@@ -3078,7 +3080,6 @@ private BroadcastReceiver interactiveStateReceiver = new BroadcastReceiver() {
                 unregisterReceiver(interactiveStateReceiver);
                 registeredInteractiveState = false;
             }
-
             abortPulse();
             if (callStateListener != null) {
                 TelephonyManager tm = (TelephonyManager) getSystemService(Context.TELEPHONY_SERVICE);
