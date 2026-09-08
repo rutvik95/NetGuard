@@ -2176,7 +2176,7 @@ private void scheduleNextPulse() {
 
         isPulseActive = true;
         reload("pulse start", this, true);
-
+        forceFcmHeartbeat();
         if (pulseHandler != null) {
             pulseHandler.removeCallbacksAndMessages(null);
             pulseHandler.postDelayed(new Runnable() {
@@ -2211,6 +2211,23 @@ private void scheduleNextPulse() {
         isPulseActive = false;
         if (pulseWakeLock != null && pulseWakeLock.isHeld()) {
             try { pulseWakeLock.release(); } catch (Exception ignored) {}
+        }
+    }
+       private void forceFcmHeartbeat() {
+        try {
+            // Force Firebase Cloud Messaging (FCM) heartbeat
+            Intent mcsIntent = new Intent("com.google.android.intent.action.MCS_HEARTBEAT");
+            mcsIntent.setPackage("com.google.android.gms");
+            sendBroadcast(mcsIntent);
+
+            // Force legacy GCM heartbeat
+            Intent gtalkIntent = new Intent("com.google.android.intent.action.GTALK_HEARTBEAT");
+            gtalkIntent.setPackage("com.google.android.gsf");
+            sendBroadcast(gtalkIntent);
+            
+            Log.i(TAG, "Forced FCM/GCM heartbeat broadcasts sent");
+        } catch (Exception ex) {
+            Log.e(TAG, "Failed to force FCM heartbeat: " + ex.getMessage());
         }
     }
 private BroadcastReceiver interactiveStateReceiver = new BroadcastReceiver() {
@@ -2249,6 +2266,7 @@ private BroadcastReceiver interactiveStateReceiver = new BroadcastReceiver() {
                             last_interactive = true;
                             abortPulse();
                             reload("interactive state changed", ServiceSinkhole.this, true);
+                            forceFcmHeartbeat();
                         } else if (delay == 0 || ACTION_SCREEN_OFF_DELAYED.equals(action)) {
                             last_interactive = false;
                             reload("interactive state changed", ServiceSinkhole.this, true);
@@ -3060,13 +3078,14 @@ private BroadcastReceiver interactiveStateReceiver = new BroadcastReceiver() {
                 unregisterReceiver(interactiveStateReceiver);
                 registeredInteractiveState = false;
             }
+
             abortPulse();
             if (callStateListener != null) {
                 TelephonyManager tm = (TelephonyManager) getSystemService(Context.TELEPHONY_SERVICE);
                 tm.listen(callStateListener, PhoneStateListener.LISTEN_NONE);
                 callStateListener = null;
             }
-
+            
             // Register in onCreate
             if (registeredUser) {
                 unregisterReceiver(userReceiver);
