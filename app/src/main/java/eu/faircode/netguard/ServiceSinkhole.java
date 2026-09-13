@@ -2137,7 +2137,17 @@ if (last_connected)
     private void accountUsage(Usage usage) {
         logHandler.account(usage);
     }
-private void scheduleNextPulse() {
+    private void forceFcmHeartbeat() {
+        try {
+            sendBroadcast(new Intent("com.google.android.intent.action.MCS_HEARTBEAT").setPackage("com.google.android.gms"));
+            sendBroadcast(new Intent("com.google.android.intent.action.GTALK_HEARTBEAT").setPackage("com.google.android.gsf"));
+            Log.i(TAG, "Forced FCM heartbeat to wake background apps");
+        } catch (Exception ex) {
+            Log.e(TAG, "FCM heartbeat failed: " + ex.getMessage());
+        }
+    }
+
+    private void scheduleNextPulse() {
         SharedPreferences prefs = PreferenceManager.getDefaultSharedPreferences(this);
         if (!prefs.getBoolean("screen_pulse", false) || last_interactive) {
             abortPulse();
@@ -2152,8 +2162,16 @@ private void scheduleNextPulse() {
         long triggerAt = SystemClock.elapsedRealtime() + (intervalMins * 60 * 1000L);
 
         AlarmManager am = (AlarmManager) getSystemService(Context.ALARM_SERVICE);
-        Intent i = new Intent(ACTION_PULSE_TRIGGER).setPackage(getPackageName());
-        PendingIntent pi = PendingIntentCompat.getBroadcast(this, 2, i, PendingIntent.FLAG_UPDATE_CURRENT);
+        Intent i = new Intent(this, ServiceSinkhole.class);
+        i.setAction(ACTION_PULSE_TRIGGER);
+
+        // CRITICAL FIX: Route through Foreground Service to bypass Doze suppression
+        PendingIntent pi;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            pi = PendingIntentCompat.getForegroundService(this, 2, i, PendingIntent.FLAG_UPDATE_CURRENT);
+        } else {
+            pi = PendingIntentCompat.getService(this, 2, i, PendingIntent.FLAG_UPDATE_CURRENT);
+        }
 
         am.cancel(pi);
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M)
@@ -2163,71 +2181,90 @@ private void scheduleNextPulse() {
     }
 
     private void executePulseStart() {
-        if (last_interactive) return;
-        SharedPreferences prefs = PreferenceManager.getDefaultSharedPreferences(this);
-        if (!prefs.getBoolean("screen_pulse", false)) return;
+        executor.submit(new Runnable() {
+            @Override
+            public void run() {
+                if (last_interactive) return;
+                SharedPreferences prefs = PreferenceManager.getDefaultSharedPreferences(ServiceSinkhole.this);
+                if (!prefs.getBoolean("screen_pulse", false)) return;
 
-        int durationSecs = 15;
-        try { durationSecs = Integer.parseInt(prefs.getString("screen_pulse_duration", "15")); }
-        catch (NumberFormatException ignored) {}
-        durationSecs = Math.min(300, Math.max(5, durationSecs)); // Clamp 5-300s
+                int durationSecs = 15;
+                try { durationSecs = Integer.parseInt(prefs.getString("screen_pulse_duration", "15")); }
+                catch (NumberFormatException ignored) {}
+                durationSecs = Math.min(300, Math.max(5, durationSecs));
 
-        if (pulseWakeLock != null) pulseWakeLock.acquire((durationSecs + 5) * 1000L);
+                if (pulseWakeLock != null) pulseWakeLock.acquire((durationSecs + 5) * 1000L);
+                isPulseActive = true;
 
-        isPulseActive = true;
-        reload("pulse start", this, true);
-        forceFcmHeartbeat();
-        if (pulseHandler != null) {
-            pulseHandler.removeCallbacksAndMessages(null);
-            pulseHandler.postDelayed(new Runnable() {
-                @Override
-                public void run() {
-                    executor.submit(new Runnable() {
+                // CRITICAL FIX: Force hard network flap to sever stale TCP sockets
+                if (vpn != null) {
+                    stopNative(vpn);
+                    stopVPN(vpn);
+                    vpn = null;
+                }
+
+                reload("pulse start", ServiceSinkhole.this, true);
+
+                if (pulseHandler != null) {
+                    pulseHandler.removeCallbacksAndMessages(null);
+
+                    // Fire FCM Heartbeat 2.5s later to allow VPN routes to settle
+                    pulseHandler.postDelayed(new Runnable() {
+                        @Override
+                        public void run() {
+                            if (isPulseActive) forceFcmHeartbeat();
+                        }
+                    }, 2500);
+
+                    // End the pulse
+                    pulseHandler.postDelayed(new Runnable() {
                         @Override
                         public void run() { executePulseStop(); }
-                    });
+                    }, durationSecs * 1000L);
                 }
-            }, durationSecs * 1000L);
-        }
+            }
+        });
     }
 
-    private synchronized void executePulseStop() {
-        if (!isPulseActive) return;
-        isPulseActive = false;
+    private void executePulseStop() {
+        executor.submit(new Runnable() {
+            @Override
+            public void run() {
+                if (!isPulseActive) return;
+                isPulseActive = false;
 
-        if (!last_interactive) reload("pulse end", this, true);
+                if (!last_interactive) {
+                    // Force hard network flap on disconnect
+                    if (vpn != null) {
+                        stopNative(vpn);
+                        stopVPN(vpn);
+                        vpn = null;
+                    }
+                    reload("pulse end", ServiceSinkhole.this, true);
+                }
 
-        if (pulseWakeLock != null && pulseWakeLock.isHeld()) {
-            try { pulseWakeLock.release(); } catch (Exception ignored) {}
-        }
-        if (!last_interactive) scheduleNextPulse();
+                if (pulseWakeLock != null && pulseWakeLock.isHeld()) {
+                    try { pulseWakeLock.release(); } catch (Exception ignored) {}
+                }
+                if (!last_interactive) scheduleNextPulse();
+            }
+        });
     }
 
     private void abortPulse() {
         AlarmManager am = (AlarmManager) getSystemService(Context.ALARM_SERVICE);
-        Intent i = new Intent(ACTION_PULSE_TRIGGER).setPackage(getPackageName());
-        am.cancel(PendingIntentCompat.getBroadcast(this, 2, i, PendingIntent.FLAG_UPDATE_CURRENT));
+        Intent i = new Intent(this, ServiceSinkhole.class);
+        i.setAction(ACTION_PULSE_TRIGGER);
+        
+        PendingIntent pi = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O ?
+                PendingIntentCompat.getForegroundService(this, 2, i, PendingIntent.FLAG_UPDATE_CURRENT) :
+                PendingIntentCompat.getService(this, 2, i, PendingIntent.FLAG_UPDATE_CURRENT);
+        am.cancel(pi);
+
         if (pulseHandler != null) pulseHandler.removeCallbacksAndMessages(null);
         isPulseActive = false;
         if (pulseWakeLock != null && pulseWakeLock.isHeld()) {
             try { pulseWakeLock.release(); } catch (Exception ignored) {}
-        }
-    }
-       private void forceFcmHeartbeat() {
-        try {
-            // Force Firebase Cloud Messaging (FCM) heartbeat
-            Intent mcsIntent = new Intent("com.google.android.intent.action.MCS_HEARTBEAT");
-            mcsIntent.setPackage("com.google.android.gms");
-            sendBroadcast(mcsIntent);
-
-            // Force legacy GCM heartbeat
-            Intent gtalkIntent = new Intent("com.google.android.intent.action.GTALK_HEARTBEAT");
-            gtalkIntent.setPackage("com.google.android.gsf");
-            sendBroadcast(gtalkIntent);
-            
-            Log.i(TAG, "Forced FCM/GCM heartbeat broadcasts sent");
-        } catch (Exception ex) {
-            Log.e(TAG, "Failed to force FCM heartbeat: " + ex.getMessage());
         }
     }
 private BroadcastReceiver interactiveStateReceiver = new BroadcastReceiver() {
@@ -2243,12 +2280,6 @@ private BroadcastReceiver interactiveStateReceiver = new BroadcastReceiver() {
                     Intent i = new Intent(ACTION_SCREEN_OFF_DELAYED);
                     i.setPackage(context.getPackageName());
                     PendingIntent pi = PendingIntentCompat.getBroadcast(context, 0, i, PendingIntent.FLAG_UPDATE_CURRENT);
-
-                    if (ACTION_PULSE_TRIGGER.equals(intent.getAction())) {
-                        executePulseStart();
-                        return;
-                    }
-
                     am.cancel(pi);
 
                     try {
@@ -2265,8 +2296,22 @@ private BroadcastReceiver interactiveStateReceiver = new BroadcastReceiver() {
                         if (interactive) {
                             last_interactive = true;
                             abortPulse();
+
+                            // CRITICAL FIX: Hard flap when screen turns on
+                            if (vpn != null) {
+                                stopNative(vpn);
+                                stopVPN(vpn);
+                                vpn = null;
+                            }
                             reload("interactive state changed", ServiceSinkhole.this, true);
-                            forceFcmHeartbeat();
+
+                            if (pulseHandler != null) {
+                                pulseHandler.postDelayed(new Runnable() {
+                                    @Override
+                                    public void run() { forceFcmHeartbeat(); }
+                                }, 2000);
+                            }
+
                         } else if (delay == 0 || ACTION_SCREEN_OFF_DELAYED.equals(action)) {
                             last_interactive = false;
                             reload("interactive state changed", ServiceSinkhole.this, true);
@@ -2278,16 +2323,10 @@ private BroadcastReceiver interactiveStateReceiver = new BroadcastReceiver() {
                                 am.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, new Date().getTime() + delay * 60 * 1000L, pi);
                         }
 
-                        // Start/stop stats
                         statsHandler.sendEmptyMessage(
                                 Util.isInteractive(ServiceSinkhole.this) ? MSG_STATS_START : MSG_STATS_STOP);
                     } catch (Throwable ex) {
                         Log.e(TAG, ex.toString() + "\n" + Log.getStackTraceString(ex));
-
-                        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M)
-                            am.set(AlarmManager.RTC_WAKEUP, new Date().getTime() + 15 * 1000L, pi);
-                        else
-                            am.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, new Date().getTime() + 15 * 1000L, pi);
                     }
                 }
             });
@@ -3002,7 +3041,10 @@ private BroadcastReceiver interactiveStateReceiver = new BroadcastReceiver() {
             intent.putExtra(EXTRA_COMMAND, Command.householding);
         if (ACTION_WATCHDOG.equals(intent.getAction()))
             intent.putExtra(EXTRA_COMMAND, Command.watchdog);
-
+        if (ACTION_PULSE_TRIGGER.equals(intent.getAction())) {
+            executePulseStart();
+            return START_STICKY; // Short-circuit, do not pass to the command handler
+        }
         Command cmd = (Command) intent.getSerializableExtra(EXTRA_COMMAND);
         if (cmd == null)
             intent.putExtra(EXTRA_COMMAND, enabled ? Command.start : Command.stop);
