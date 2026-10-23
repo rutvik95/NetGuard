@@ -2241,7 +2241,7 @@ if (last_connected)
         pulseWakeLock.acquire((seconds + 30L) * 1000L);
         isPulseActive = true;
         try {
-            reload(true);
+            commandHandler.reload(true);
             pulseHandler.removeCallbacks(pulseStopRunnable);
             pulseHandler.postDelayed(pulseStopRunnable, seconds * 1000L);
             Log.i(TAG, "Screen sync opened for " + seconds + " seconds");
@@ -2262,7 +2262,7 @@ if (last_connected)
         try {
             if (state == State.enforcing && vpn != null &&
                     !last_interactive && !Util.isInteractive(this))
-                reload(true);
+                commandHandler.reload(true);
         } finally {
             if (pulseWakeLock != null && pulseWakeLock.isHeld())
                 pulseWakeLock.release();
