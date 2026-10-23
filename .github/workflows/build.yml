@@ -29,7 +29,7 @@ jobs:
 
       - name: Install Android platform and NDK
         run: |
-          sdkmanager --install "platforms;android-36" "build-tools;36.0.0" "ndk;25.2.9519653"
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "platforms;android-36" "build-tools;36.0.0" "ndk;25.2.9519653"
 
       # app/build.gradle reads keystore.properties at configuration time and
       # fails without it, even for a debug build. This throwaway key only
