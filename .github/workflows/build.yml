@@ -21,11 +21,15 @@ jobs:
           java-version: '17'
           cache: gradle
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+      - name: Verify Android SDK
+        run: |
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          test -d "$ANDROID_HOME"
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --version || sdkmanager --version
 
-      - name: Install NDK
-        run: sdkmanager --install "ndk;25.2.9519653"
+      - name: Install Android platform and NDK
+        run: |
+          sdkmanager --install "platforms;android-36" "build-tools;36.0.0" "ndk;25.2.9519653"
 
       # app/build.gradle reads keystore.properties at configuration time and
       # fails without it, even for a debug build. This throwaway key only
