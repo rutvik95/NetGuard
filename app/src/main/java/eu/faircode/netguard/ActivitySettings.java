@@ -144,7 +144,7 @@ public class ActivitySettings extends AppCompatActivity implements SharedPrefere
 
         // Handle periodic screen off pulse
         Preference pref_pulse_interval = screen.findPreference("screen_pulse_interval");
-        if (pref_pulse_interval != null) pref_pulse_interval.setTitle(getString(R.string.setting_pulse_interval, prefs.getString("screen_pulse_interval", "15")));
+        if (pref_pulse_interval != null) pref_pulse_interval.setTitle(getString(R.string.setting_pulse_interval, prefs.getString("screen_pulse_interval", "30")));
         Preference pref_pulse_duration = screen.findPreference("screen_pulse_duration");
         if (pref_pulse_duration != null) pref_pulse_duration.setTitle(getString(R.string.setting_pulse_duration, prefs.getString("screen_pulse_duration", "15")));
 
@@ -559,7 +559,7 @@ public class ActivitySettings extends AppCompatActivity implements SharedPrefere
             ServiceSinkhole.reload("changed " + name, this, false);
 
         else if ("screen_pulse_interval".equals(name))
-            getPreferenceScreen().findPreference(name).setTitle(getString(R.string.setting_pulse_interval, prefs.getString(name, "15")));
+            getPreferenceScreen().findPreference(name).setTitle(getString(R.string.setting_pulse_interval, prefs.getString(name, "30")));
 
         else if ("screen_pulse_duration".equals(name))
             getPreferenceScreen().findPreference(name).setTitle(getString(R.string.setting_pulse_duration, prefs.getString(name, "15")));

@@ -136,10 +136,23 @@ public class ServiceSinkhole extends VpnService implements SharedPreferences.OnS
     private boolean last_connected = false;
     private boolean last_metered = true;
     private boolean last_interactive = false;
-    // Screen-off pulse states
+    // Apply the existing screen-on app rules temporarily without disabling the VPN.
     private volatile boolean isPulseActive = false;
+    private volatile boolean pulseScheduled = false;
     private PowerManager.WakeLock pulseWakeLock = null;
     private Handler pulseHandler = null;
+    private final Runnable pulseStopRunnable = new Runnable() {
+        @Override
+        public void run() {
+            if (commandHandler != null && isPulseActive) {
+                // Every queued command carries the matching service wake lock.
+                getLock(ServiceSinkhole.this).acquire();
+                Intent intent = new Intent(ServiceSinkhole.this, ServiceSinkhole.class);
+                intent.putExtra(EXTRA_COMMAND, Command.pulse_stop);
+                commandHandler.queue(intent);
+            }
+        }
+    };
     private int last_allowed = -1;
     private int last_blocked = -1;
     private int last_hosts = -1;
@@ -197,7 +210,7 @@ public class ServiceSinkhole extends VpnService implements SharedPreferences.OnS
 
     private enum State {none, waiting, enforcing, stats}
 
-    public enum Command {run, start, reload, stop, stats, set, householding, watchdog}
+    public enum Command {run, start, reload, stop, stats, set, householding, watchdog, pulse_start, pulse_stop}
 
     private static volatile PowerManager.WakeLock wlInstance = null;
 
@@ -434,6 +447,7 @@ public class ServiceSinkhole extends VpnService implements SharedPreferences.OnS
                         break;
 
                     case stop:
+                        abortPulse();
                         stop(temporarilyStopped);
                         break;
 
@@ -448,6 +462,14 @@ public class ServiceSinkhole extends VpnService implements SharedPreferences.OnS
 
                     case watchdog:
                         watchdog(intent);
+                        break;
+
+                    case pulse_start:
+                        beginPulse();
+                        break;
+
+                    case pulse_stop:
+                        endPulse();
                         break;
 
                     default:
@@ -481,6 +503,11 @@ public class ServiceSinkhole extends VpnService implements SharedPreferences.OnS
                         !prefs.getBoolean("enabled", false) &&
                         !prefs.getBoolean("show_stats", false))
                     stopForeground(true);
+
+                // Re-arm after service startup while already screen-off.
+                // This is idempotent: ordinary VPN reloads do not postpone an armed alarm.
+                if (cmd == Command.start || cmd == Command.reload)
+                    scheduleNextPulse();
 
                 // Request garbage collection
                 System.gc();
@@ -2137,136 +2164,122 @@ if (last_connected)
     private void accountUsage(Usage usage) {
         logHandler.account(usage);
     }
-    private void forceFcmHeartbeat() {
+
+    private int pulseNumber(SharedPreferences prefs, String key, int fallback, int minimum, int maximum) {
         try {
-            sendBroadcast(new Intent("com.google.android.intent.action.MCS_HEARTBEAT").setPackage("com.google.android.gms"));
-            sendBroadcast(new Intent("com.google.android.intent.action.GTALK_HEARTBEAT").setPackage("com.google.android.gsf"));
-            Log.i(TAG, "Forced FCM heartbeat to wake background apps");
-        } catch (Exception ex) {
-            Log.e(TAG, "FCM heartbeat failed: " + ex.getMessage());
+            int value = Integer.parseInt(prefs.getString(key, Integer.toString(fallback)));
+            return Math.min(maximum, Math.max(minimum, value));
+        } catch (NumberFormatException ex) {
+            return fallback;
         }
     }
 
-    private void scheduleNextPulse() {
+    private PendingIntent getPulseIntent() {
+        Intent intent = new Intent(this, ServiceSinkhole.class);
+        intent.setAction(ACTION_PULSE_TRIGGER);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
+            return PendingIntentCompat.getForegroundService(this, 2, intent, PendingIntent.FLAG_UPDATE_CURRENT);
+        return PendingIntentCompat.getService(this, 2, intent, PendingIntent.FLAG_UPDATE_CURRENT);
+    }
+
+    private synchronized void cancelPulseAlarm() {
+        AlarmManager manager = (AlarmManager) getSystemService(Context.ALARM_SERVICE);
+        if (manager != null)
+            manager.cancel(getPulseIntent());
+        pulseScheduled = false;
+    }
+
+    private synchronized void scheduleNextPulse() {
         SharedPreferences prefs = PreferenceManager.getDefaultSharedPreferences(this);
-        if (!prefs.getBoolean("screen_pulse", false) || last_interactive) {
-            abortPulse();
+        if (!prefs.getBoolean("enabled", false) ||
+                !prefs.getBoolean("screen_on", true) ||
+                !prefs.getBoolean("screen_pulse", false) ||
+                temporarilyStopped || Util.isInteractive(this) ||
+                state != State.enforcing || vpn == null) {
+            cancelPulseAlarm();
             return;
         }
 
-        int intervalMins = 15;
-        try { intervalMins = Integer.parseInt(prefs.getString("screen_pulse_interval", "15")); }
-        catch (NumberFormatException ignored) {}
-        intervalMins = Math.max(1, intervalMins); // Minimum 1 minute
+        if (pulseScheduled || isPulseActive)
+            return;
 
-        long triggerAt = SystemClock.elapsedRealtime() + (intervalMins * 60 * 1000L);
+        int minutes = pulseNumber(prefs, "screen_pulse_interval", 30, 1, 1440);
+        long triggerAt = SystemClock.elapsedRealtime() + minutes * 60_000L;
+        AlarmManager manager = (AlarmManager) getSystemService(Context.ALARM_SERVICE);
+        if (manager == null)
+            return;
 
-        AlarmManager am = (AlarmManager) getSystemService(Context.ALARM_SERVICE);
-        Intent i = new Intent(this, ServiceSinkhole.class);
-        i.setAction(ACTION_PULSE_TRIGGER);
+        try {
+            // Inexact, idle-capable alarm. No SCHEDULE_EXACT_ALARM permission.
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M)
+                manager.setAndAllowWhileIdle(AlarmManager.ELAPSED_REALTIME_WAKEUP,
+                        triggerAt, getPulseIntent());
+            else
+                manager.set(AlarmManager.ELAPSED_REALTIME_WAKEUP, triggerAt, getPulseIntent());
+            pulseScheduled = true;
+            Log.i(TAG, "Screen sync armed for approximately " + minutes + " minutes");
+        } catch (RuntimeException ex) {
+            pulseScheduled = false;
+            Log.e(TAG, "Unable to schedule screen sync", ex);
+        }
+    }
 
-        // CRITICAL FIX: Route through Foreground Service to bypass Doze suppression
-        PendingIntent pi;
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            pi = PendingIntentCompat.getForegroundService(this, 2, i, PendingIntent.FLAG_UPDATE_CURRENT);
-        } else {
-            pi = PendingIntentCompat.getService(this, 2, i, PendingIntent.FLAG_UPDATE_CURRENT);
+    // Called by the serialized VPN command handler.
+    private void beginPulse() {
+        SharedPreferences prefs = PreferenceManager.getDefaultSharedPreferences(this);
+        if (isPulseActive ||
+                !prefs.getBoolean("enabled", false) ||
+                !prefs.getBoolean("screen_on", true) ||
+                !prefs.getBoolean("screen_pulse", false) ||
+                temporarilyStopped || state != State.enforcing || vpn == null ||
+                last_interactive || Util.isInteractive(this)) {
+            scheduleNextPulse();
+            return;
         }
 
-        am.cancel(pi);
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M)
-            am.setExactAndAllowWhileIdle(AlarmManager.ELAPSED_REALTIME_WAKEUP, triggerAt, pi);
-        else
-            am.set(AlarmManager.ELAPSED_REALTIME_WAKEUP, triggerAt, pi);
+        int seconds = pulseNumber(prefs, "screen_pulse_duration", 15, 5, 300);
+        pulseWakeLock.acquire((seconds + 30L) * 1000L);
+        isPulseActive = true;
+        try {
+            reload(true);
+            pulseHandler.removeCallbacks(pulseStopRunnable);
+            pulseHandler.postDelayed(pulseStopRunnable, seconds * 1000L);
+            Log.i(TAG, "Screen sync opened for " + seconds + " seconds");
+        } catch (Throwable ex) {
+            Log.e(TAG, "Screen sync start failed", ex);
+            endPulse();
+        }
     }
 
-    private void executePulseStart() {
-        executor.submit(new Runnable() {
-            @Override
-            public void run() {
-                if (last_interactive) return;
-                SharedPreferences prefs = PreferenceManager.getDefaultSharedPreferences(ServiceSinkhole.this);
-                if (!prefs.getBoolean("screen_pulse", false)) return;
-
-                int durationSecs = 15;
-                try { durationSecs = Integer.parseInt(prefs.getString("screen_pulse_duration", "15")); }
-                catch (NumberFormatException ignored) {}
-                durationSecs = Math.min(300, Math.max(5, durationSecs));
-
-                if (pulseWakeLock != null) pulseWakeLock.acquire((durationSecs + 5) * 1000L);
-                isPulseActive = true;
-
-                // CRITICAL FIX: Force hard network flap to sever stale TCP sockets
-                if (vpn != null) {
-                    stopNative(vpn);
-                    stopVPN(vpn);
-                    vpn = null;
-                }
-
-                reload("pulse start", ServiceSinkhole.this, true);
-
-                if (pulseHandler != null) {
-                    pulseHandler.removeCallbacksAndMessages(null);
-
-                    // Fire FCM Heartbeat 2.5s later to allow VPN routes to settle
-                    pulseHandler.postDelayed(new Runnable() {
-                        @Override
-                        public void run() {
-                            if (isPulseActive) forceFcmHeartbeat();
-                        }
-                    }, 2500);
-
-                    // End the pulse
-                    pulseHandler.postDelayed(new Runnable() {
-                        @Override
-                        public void run() { executePulseStop(); }
-                    }, durationSecs * 1000L);
-                }
-            }
-        });
-    }
-
-    private void executePulseStop() {
-        executor.submit(new Runnable() {
-            @Override
-            public void run() {
-                if (!isPulseActive) return;
-                isPulseActive = false;
-
-                if (!last_interactive) {
-                    // Force hard network flap on disconnect
-                    if (vpn != null) {
-                        stopNative(vpn);
-                        stopVPN(vpn);
-                        vpn = null;
-                    }
-                    reload("pulse end", ServiceSinkhole.this, true);
-                }
-
-                if (pulseWakeLock != null && pulseWakeLock.isHeld()) {
-                    try { pulseWakeLock.release(); } catch (Exception ignored) {}
-                }
-                if (!last_interactive) scheduleNextPulse();
-            }
-        });
-    }
-
-    private void abortPulse() {
-        AlarmManager am = (AlarmManager) getSystemService(Context.ALARM_SERVICE);
-        Intent i = new Intent(this, ServiceSinkhole.class);
-        i.setAction(ACTION_PULSE_TRIGGER);
-        
-        PendingIntent pi = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O ?
-                PendingIntentCompat.getForegroundService(this, 2, i, PendingIntent.FLAG_UPDATE_CURRENT) :
-                PendingIntentCompat.getService(this, 2, i, PendingIntent.FLAG_UPDATE_CURRENT);
-        am.cancel(pi);
-
-        if (pulseHandler != null) pulseHandler.removeCallbacksAndMessages(null);
+    // Called by the serialized VPN command handler.
+    private void endPulse() {
+        if (!isPulseActive) {
+            scheduleNextPulse();
+            return;
+        }
         isPulseActive = false;
-        if (pulseWakeLock != null && pulseWakeLock.isHeld()) {
-            try { pulseWakeLock.release(); } catch (Exception ignored) {}
+        pulseHandler.removeCallbacks(pulseStopRunnable);
+        try {
+            if (state == State.enforcing && vpn != null &&
+                    !last_interactive && !Util.isInteractive(this))
+                reload(true);
+        } finally {
+            if (pulseWakeLock != null && pulseWakeLock.isHeld())
+                pulseWakeLock.release();
+            scheduleNextPulse();
+            Log.i(TAG, "Screen sync closed");
         }
     }
+
+    private synchronized void abortPulse() {
+        cancelPulseAlarm();
+        if (pulseHandler != null)
+            pulseHandler.removeCallbacks(pulseStopRunnable);
+        isPulseActive = false;
+        if (pulseWakeLock != null && pulseWakeLock.isHeld())
+            pulseWakeLock.release();
+    }
+
 private BroadcastReceiver interactiveStateReceiver = new BroadcastReceiver() {
         @Override
         public void onReceive(final Context context, final Intent intent) {
@@ -2293,25 +2306,11 @@ private BroadcastReceiver interactiveStateReceiver = new BroadcastReceiver() {
                         String action = intent.getAction();
                         boolean interactive = Intent.ACTION_SCREEN_ON.equals(action);
 
+
                         if (interactive) {
                             last_interactive = true;
                             abortPulse();
-
-                            // CRITICAL FIX: Hard flap when screen turns on
-                            if (vpn != null) {
-                                stopNative(vpn);
-                                stopVPN(vpn);
-                                vpn = null;
-                            }
                             reload("interactive state changed", ServiceSinkhole.this, true);
-
-                            if (pulseHandler != null) {
-                                pulseHandler.postDelayed(new Runnable() {
-                                    @Override
-                                    public void run() { forceFcmHeartbeat(); }
-                                }, 2000);
-                            }
-
                         } else if (delay == 0 || ACTION_SCREEN_OFF_DELAYED.equals(action)) {
                             last_interactive = false;
                             reload("interactive state changed", ServiceSinkhole.this, true);
@@ -2979,8 +2978,16 @@ private BroadcastReceiver interactiveStateReceiver = new BroadcastReceiver() {
         return (network != null && network.equals(getActiveNetwork()));
     }
 
+
     @Override
     public void onSharedPreferenceChanged(SharedPreferences prefs, String name) {
+        if ("screen_pulse".equals(name) || "screen_pulse_interval".equals(name) ||
+                "screen_pulse_duration".equals(name) || "screen_on".equals(name)) {
+            abortPulse();
+            if (prefs.getBoolean("enabled", false))
+                reload("screen sync setting changed", this, true);
+        }
+
         if ("theme".equals(name)) {
             Log.i(TAG, "Theme changed");
             Util.setTheme(this);
@@ -2988,14 +2995,6 @@ private BroadcastReceiver interactiveStateReceiver = new BroadcastReceiver() {
                 Log.d(TAG, "Stop foreground state=" + state.toString());
                 stopForeground(true);
             }
-            if ("screen_pulse".equals(name) || "screen_pulse_interval".equals(name) || "screen_pulse_duration".equals(name)) {
-            if (prefs.getBoolean("screen_pulse", false)) {
-                if (!last_interactive) scheduleNextPulse();
-            } else {
-                abortPulse();
-                if (!last_interactive) reload("pulse disabled", this, true);
-            }
-        }
             if (state == State.enforcing)
                 startForeground(NOTIFY_ENFORCING, getEnforcingNotification(-1, -1, -1));
             else if (state != State.none)
@@ -3042,8 +3041,8 @@ private BroadcastReceiver interactiveStateReceiver = new BroadcastReceiver() {
         if (ACTION_WATCHDOG.equals(intent.getAction()))
             intent.putExtra(EXTRA_COMMAND, Command.watchdog);
         if (ACTION_PULSE_TRIGGER.equals(intent.getAction())) {
-            executePulseStart();
-            return START_STICKY; // Short-circuit, do not pass to the command handler
+            pulseScheduled = false;
+            intent.putExtra(EXTRA_COMMAND, Command.pulse_start);
         }
         Command cmd = (Command) intent.getSerializableExtra(EXTRA_COMMAND);
         if (cmd == null)

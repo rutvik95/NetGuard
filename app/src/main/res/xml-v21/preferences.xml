@@ -75,7 +75,7 @@
                 android:summary="@string/summary_pulse"
                 android:title="@string/setting_pulse" />
             <EditTextPreference
-                android:defaultValue="15"
+                android:defaultValue="30"
                 android:dependency="screen_pulse"
                 android:inputType="number"
                 android:key="screen_pulse_interval"
